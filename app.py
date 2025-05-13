@@ -1,24 +1,37 @@
 import streamlit as st
+from langchain_core.documents import Document
+
+st.set_page_config(
+    page_title="⚡ Smart PDF Chat (MongoDB)",
+    layout="wide",
+    page_icon="⚡"
+)
 import os
 import hashlib
 import time
 from pathlib import Path
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import Ollama
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.callbacks.base import BaseCallbackHandler
 from sentence_transformers import util
+from pymongo import MongoClient
+from langchain_mongodb import MongoDBAtlasVectorSearch
 
 # ========== CONSTANTS ==========
-VECTOR_STORE_DIR = Path("knowledge_base/faiss_index")
 PDF_UPLOAD_DIR = Path("uploaded_pdfs")
-IRRELEVANT_THRESHOLD = 0.7  # Similarity threshold for relevance
+IRRELEVANT_THRESHOLD = 0.1  # Similarity threshold for relevance
 TIMEOUT_SECONDS = 15  # Max time to wait for response
 MAX_RETRIEVAL_DOCS = 3  # Number of docs to retrieve
+
+# MongoDB Atlas Configuration
+MONGO_URI = "mongodb+srv://vicky:vicky@cluster0.syoeipa.mongodb.net/RAG?retryWrites=true&w=majority"
+DB_NAME = "RAG"
+COLLECTION_NAME = "document_vectors"
+INDEX_NAME = "vector_index_1"
 
 # Response Templates
 TEMPLATES = {
@@ -28,8 +41,37 @@ TEMPLATES = {
     "welcome": "Upload a PDF document to get started!",
     "processing": "Processing your document...",
     "ready": "Document processed! Ask me anything about it.",
-    "initial_think": "I'm getting ready to chat with you..."
+    "initial_think": "I'm getting ready to chat with you...",
+    "db_error": "⚠️ Database connection failed. Please check your MongoDB connection settings.",
+    "db_connected": "✅ Successfully connected to MongoDB Atlas"
 }
+
+
+# ========== DATABASE CONNECTION ==========
+@st.cache_resource
+def init_mongo_connection():
+    """Initialize and cache the MongoDB connection"""
+    try:
+        client = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=30000,
+            socketTimeoutMS=30000
+        )
+        client.admin.command('ping')  # Check connection
+        return client, None
+    except Exception as e:
+        return None, str(e)
+
+
+# Initialize MongoDB connection when app starts
+mongo_client, mongo_error = init_mongo_connection()
+
+if mongo_error:
+    st.error(f"{TEMPLATES['db_error']}: {mongo_error}")
+    st.stop()
+else:
+    st.toast(TEMPLATES["db_connected"], icon="✅")
 
 
 # ========== CUSTOM HANDLERS ==========
@@ -70,32 +112,57 @@ def save_uploaded_file(uploaded_file) -> Path:
     return file_path
 
 
-def get_vectorstore(text, file_hash: str):
-    pdf_vectorstore_path = VECTOR_STORE_DIR / f"{file_hash}_index"
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={'normalize_embeddings': True}
-    )
+def get_vectorstore(text: str, file_hash: str):
+    """Create or load MongoDB Atlas vector store using Document objects"""
+    try:
+        collection = mongo_client[DB_NAME][COLLECTION_NAME]
 
-    if pdf_vectorstore_path.exists():
-        st.info("Loading existing knowledge base...")
-        return FAISS.load_local(
-            str(pdf_vectorstore_path),
-            embeddings,
-            allow_dangerous_deserialization=True
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
         )
 
-    with st.spinner(TEMPLATES["processing"]):
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=150,
-            length_function=len
-        )
-        chunks = splitter.split_text(text)
-        vectorstore = FAISS.from_texts(chunks, embeddings)
-        vectorstore.save_local(str(pdf_vectorstore_path))
-    return vectorstore
+        # Check if document already exists
+        existing_doc = collection.find_one({"metadata.document_hash": file_hash})
+        if existing_doc:
+            st.info("Loading existing knowledge base...")
+            return MongoDBAtlasVectorSearch(
+                collection=collection,
+                embedding=embeddings,
+                index_name=INDEX_NAME,
+                embedding_key="embedding",
+                text_key="text",
+                relevance_score_fn="cosine"
+            )
+
+        with st.spinner("Processing and indexing document..."):
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=150,
+                length_function=len
+            )
+            chunks = splitter.split_text(text)
+
+            documents = [
+                Document(page_content=chunk, metadata={"document_hash": file_hash})
+                for chunk in chunks
+            ]
+
+            vectorstore = MongoDBAtlasVectorSearch.from_documents(
+                documents=documents,
+                embedding=embeddings,
+                collection=collection,
+                index_name=INDEX_NAME,
+                embedding_key="embedding",
+                text_key="text"
+            )
+
+        return vectorstore
+
+    except Exception as e:
+        st.error(f"Database operation failed: {str(e)}")
+        st.stop()
 
 
 def is_relevant(query: str, vectorstore) -> bool:
@@ -103,22 +170,26 @@ def is_relevant(query: str, vectorstore) -> bool:
     try:
         if not vectorstore:
             return False
-
-        # Get most similar chunk
-        docs = vectorstore.similarity_search(query, k=1)
+        print("vicky")
+        # Get the most similar document
+        docs = vectorstore.similarity_search(query, k=2)
+        print("docs   ",docs)
         if not docs:
             return False
 
         # Calculate semantic similarity
         embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'}
         )
         query_embedding = embeddings.embed_query(query)
         doc_embedding = embeddings.embed_query(docs[0].page_content)
 
         similarity = util.pytorch_cos_sim(query_embedding, doc_embedding).item()
+        print(similarity)
         return similarity > IRRELEVANT_THRESHOLD
-    except:
+    except Exception as e:
+        st.error(f"Relevance check error: {str(e)}")
         return False
 
 
@@ -131,12 +202,22 @@ def show_thinking_animation():
             time.sleep(0.5)
 
 
+def clear_document_data(file_hash: str):
+    """Remove all vectors for a specific document"""
+    try:
+        collection = mongo_client[DB_NAME][COLLECTION_NAME]
+        result = collection.delete_many({"metadata.document_hash": file_hash})
+        st.toast(f"Deleted {result.deleted_count} document chunks", icon="🗑️")
+    except Exception as e:
+        st.error(f"Failed to delete document: {str(e)}")
+
+
 # ========== STREAMLIT APP ==========
 def main():
     # Initialize session state
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
-        st.session_state.initial_load = True  # New flag for initial load
+        st.session_state.initial_load = True
 
     if "processed_pdf_hash" not in st.session_state:
         st.session_state.processed_pdf_hash = None
@@ -145,16 +226,9 @@ def main():
         st.session_state.vectorstore = None
 
     # Create directories
-    VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
     PDF_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    # UI Configuration
-    st.set_page_config(
-        page_title="⚡ Smart PDF Chat",
-        layout="wide",
-        page_icon="⚡"
-    )
-    st.title("⚡ Intelligent Document Assistant using sentence-transformers/all-MiniLM-L6-v2 and ollama LLM mistral ")
+    st.title("⚡ Intelligent Document Assistant with MongoDB Atlas")
 
     # Sidebar
     with st.sidebar:
@@ -171,7 +245,16 @@ def main():
 
         if st.session_state.vectorstore and st.button("Clear Chat History"):
             st.session_state.chat_history = []
-            st.session_state.initial_load = True  # Reset on clear
+            st.session_state.initial_load = True
+            st.rerun()
+
+        # Add option to remove current document from database
+        if st.session_state.processed_pdf_hash and st.button("Remove Document from DB"):
+            clear_document_data(st.session_state.processed_pdf_hash)
+            st.session_state.processed_pdf_hash = None
+            st.session_state.vectorstore = None
+            st.session_state.chat_history = []
+            st.success("Document removed from database!")
             st.rerun()
 
     # File uploader
@@ -189,7 +272,7 @@ def main():
             with st.spinner(TEMPLATES["processing"]):
                 st.session_state.processed_pdf_hash = file_hash
                 st.session_state.chat_history = []
-                st.session_state.initial_load = True  # Reset on new doc
+                st.session_state.initial_load = True
 
                 pdf_path = save_uploaded_file(uploaded_file)
                 raw_text = extract_text_from_pdf(uploaded_file)
@@ -200,24 +283,9 @@ def main():
 
     # Chat interface
     if st.session_state.vectorstore:
-        # Show initial thinking animation only once
         if st.session_state.initial_load:
             show_thinking_animation()
             st.session_state.initial_load = False
-
-        retriever = st.session_state.vectorstore.as_retriever(
-            search_type="mmr",
-            search_kwargs={
-                "k": MAX_RETRIEVAL_DOCS,
-                "fetch_k": min(10, MAX_RETRIEVAL_DOCS * 3)
-            }
-        )
-
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"
-        )
 
         # Display chat history
         for message in st.session_state.chat_history:
@@ -232,7 +300,6 @@ def main():
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
-                # Immediate relevance check
                 if not is_relevant(prompt, st.session_state.vectorstore):
                     st.markdown(TEMPLATES["irrelevant"])
                     st.session_state.chat_history.append({
@@ -240,34 +307,53 @@ def main():
                         "content": TEMPLATES["irrelevant"]
                     })
                 else:
-                    # Prepare for fast response
                     stream_container = st.empty()
                     stream_handler = SmartStreamHandler(stream_container)
 
                     try:
+                        # Create retriever with document filter
+                        retriever = st.session_state.vectorstore.as_retriever(
+                            search_type="similarity",
+                            search_kwargs={
+                                "k": MAX_RETRIEVAL_DOCS,
+                                "filter": {"metadata.document_hash": st.session_state.processed_pdf_hash}
+                            }
+                        )
+                        print("vicky111")
+                        memory = ConversationBufferMemory(
+                            memory_key="chat_history",
+                            return_messages=True,
+                            output_key="answer"
+                        )
+                        print("vicky2222")
                         llm = Ollama(
                             model=model_name,
                             temperature=temperature,
                             callbacks=[stream_handler]
                         )
+                        print("vicky3333")
 
                         qa_chain = ConversationalRetrievalChain.from_llm(
                             llm=llm,
                             retriever=retriever,
                             memory=memory,
-                            return_source_documents=False,
+                            return_source_documents=True,
                             max_tokens_limit=500,
-                            verbose=False
+                            verbose=True
                         )
-
-                        # Get response with timeout protection
                         response = qa_chain({"question": prompt})
 
-                        # Finalize response
-                        stream_container.markdown(stream_handler.text)
+                        # Extract the answer from the response (usually under 'answer' key)
+                        answer = response["answer"]
+                        print("response:", answer)
+
+                        # Display the streamed response in Streamlit
+                        stream_container.markdown(answer)
+
+                        # Save the assistant's response to chat history
                         st.session_state.chat_history.append({
                             "role": "assistant",
-                            "content": stream_handler.text
+                            "content": answer
                         })
 
                     except TimeoutError:
@@ -276,7 +362,8 @@ def main():
                             "role": "assistant",
                             "content": TEMPLATES["timeout"]
                         })
-                    except Exception:
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
                         st.markdown(TEMPLATES["no_answer"])
                         st.session_state.chat_history.append({
                             "role": "assistant",
