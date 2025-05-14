@@ -1,6 +1,8 @@
 import streamlit as st
+from langchain.chains.llm import LLMChain
 from langchain_core.documents import Document
-
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain.memory import ChatMessageHistory
 st.set_page_config(
     page_title="⚡ Smart PDF Chat (MongoDB)",
     layout="wide",
@@ -23,7 +25,7 @@ from langchain_mongodb import MongoDBAtlasVectorSearch
 
 # ========== CONSTANTS ==========
 PDF_UPLOAD_DIR = Path("uploaded_pdfs")
-IRRELEVANT_THRESHOLD = 0.1  # Similarity threshold for relevance
+IRRELEVANT_THRESHOLD = 0.3  # Similarity threshold for relevance
 TIMEOUT_SECONDS = 15  # Max time to wait for response
 MAX_RETRIEVAL_DOCS = 3  # Number of docs to retrieve
 
@@ -37,7 +39,7 @@ INDEX_NAME = "vector_index_1"
 TEMPLATES = {
     "irrelevant": "I can only answer questions about the document. Please ask something related to the uploaded PDF.",
     "timeout": "I'm taking too long to respond. Please try a different question or simplify your query.",
-    "no_answer": "I couldn't find an answer in the document. Could you rephrase your question?",
+    # "no_answer": "I couldn't find an answer in the document. Could you rephrase your question?",
     "welcome": "Upload a PDF document to get started!",
     "processing": "Processing your document...",
     "ready": "Document processed! Ask me anything about it.",
@@ -225,30 +227,21 @@ def main():
     if "vectorstore" not in st.session_state:
         st.session_state.vectorstore = None
 
-    # Create directories
     PDF_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     st.title("⚡ Intelligent Document Assistant with MongoDB Atlas")
 
-    # Sidebar
+    # Sidebar settings
     with st.sidebar:
         st.header("Settings")
-        model_name = st.selectbox(
-            "Ollama Model",
-            ["mistral", "llama3.2", "llama2"],
-            index=0
-        )
-        temperature = st.slider(
-            "Response Creativity",
-            0.0, 1.0, 0.3, 0.1
-        )
+        model_name = st.selectbox("Ollama Model", ["mistral", "llama3.2", "llama2"], index=0)
+        temperature = st.slider("Response Creativity", 0.0, 1.0, 0.3, 0.1)
 
         if st.session_state.vectorstore and st.button("Clear Chat History"):
             st.session_state.chat_history = []
             st.session_state.initial_load = True
             st.rerun()
 
-        # Add option to remove current document from database
         if st.session_state.processed_pdf_hash and st.button("Remove Document from DB"):
             clear_document_data(st.session_state.processed_pdf_hash)
             st.session_state.processed_pdf_hash = None
@@ -257,13 +250,8 @@ def main():
             st.success("Document removed from database!")
             st.rerun()
 
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "Upload PDF Document",
-        type=["pdf"]
-    )
-
-    # Process uploaded file
+    # PDF upload
+    uploaded_file = st.file_uploader("Upload PDF Document", type=["pdf"])
     if uploaded_file:
         file_hash = get_file_hash(uploaded_file)
         uploaded_file.seek(0)
@@ -287,15 +275,14 @@ def main():
             show_thinking_animation()
             st.session_state.initial_load = False
 
-        # Display chat history
-        for message in st.session_state.chat_history:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+        # Display past messages
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
         # Chat input
         if prompt := st.chat_input("Ask about the document"):
             st.session_state.chat_history.append({"role": "user", "content": prompt})
-
             with st.chat_message("user"):
                 st.markdown(prompt)
 
@@ -311,28 +298,35 @@ def main():
                     stream_handler = SmartStreamHandler(stream_container)
 
                     try:
-                        # Create retriever with document filter
+                        # Convert session history to LangChain format
+                        lc_messages = []
+                        for item in st.session_state.chat_history:
+                            if item["role"] == "user":
+                                lc_messages.append(HumanMessage(content=item["content"]))
+                            elif item["role"] == "assistant":
+                                lc_messages.append(AIMessage(content=item["content"]))
+
+                        memory = ConversationBufferMemory(
+                            memory_key="chat_history",
+                            return_messages=True,
+                            output_key="answer",
+                            chat_memory=ChatMessageHistory(messages=lc_messages)
+                        )
+
                         retriever = st.session_state.vectorstore.as_retriever(
                             search_type="similarity",
                             search_kwargs={
                                 "k": MAX_RETRIEVAL_DOCS,
-                                "filter": {"metadata.document_hash": st.session_state.processed_pdf_hash}
+                                # "filter": {"metadata.document_hash": st.session_state.processed_pdf_hash}
                             }
                         )
-                        print("vicky111")
-                        memory = ConversationBufferMemory(
-                            memory_key="chat_history",
-                            return_messages=True,
-                            output_key="answer"
-                        )
-                        print("vicky2222")
+
                         llm = Ollama(
                             model=model_name,
                             temperature=temperature,
                             callbacks=[stream_handler]
                         )
-                        print("vicky3333")
-
+                        # question_generator_chain = LLMChain(llm=llm, prompt=prompt)
                         qa_chain = ConversationalRetrievalChain.from_llm(
                             llm=llm,
                             retriever=retriever,
@@ -341,16 +335,14 @@ def main():
                             max_tokens_limit=500,
                             verbose=True
                         )
-                        response = qa_chain({"question": prompt})
-
-                        # Extract the answer from the response (usually under 'answer' key)
+                        print(qa_chain)
+                        response = qa_chain.invoke({"question": prompt})
+                        print("response......... ",response)
                         answer = response["answer"]
-                        print("response:", answer)
+                        print("answer ",answer)
 
-                        # Display the streamed response in Streamlit
                         stream_container.markdown(answer)
 
-                        # Save the assistant's response to chat history
                         st.session_state.chat_history.append({
                             "role": "assistant",
                             "content": answer
@@ -371,7 +363,6 @@ def main():
                         })
     else:
         st.info(TEMPLATES["welcome"])
-
 
 if __name__ == "__main__":
     main()
