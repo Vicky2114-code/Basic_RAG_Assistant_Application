@@ -1,8 +1,11 @@
 import streamlit as st
 from langchain.chains.llm import LLMChain
+from langchain.chains.retrieval_qa.base import RetrievalQA
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain.memory import ChatMessageHistory
+from langchain_core.prompts import PromptTemplate
+
 st.set_page_config(
     page_title="⚡ Smart PDF Chat (MongoDB)",
     layout="wide",
@@ -140,8 +143,8 @@ def get_vectorstore(text: str, file_hash: str):
 
         with st.spinner("Processing and indexing document..."):
             splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=150,
+                chunk_size=800,
+                chunk_overlap=100,
                 length_function=len
             )
             chunks = splitter.split_text(text)
@@ -269,24 +272,25 @@ def main():
                     st.session_state.vectorstore = get_vectorstore(raw_text, file_hash)
                     st.success(TEMPLATES["ready"])
 
-    # Chat interface
+    # Chat interface - optimized version
     if st.session_state.vectorstore:
         if st.session_state.initial_load:
             show_thinking_animation()
             st.session_state.initial_load = False
 
-        # Display past messages
+        # Display chat history
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-        # Chat input
+        # Process user input
         if prompt := st.chat_input("Ask about the document"):
             st.session_state.chat_history.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
+                # Check question relevance first
                 if not is_relevant(prompt, st.session_state.vectorstore):
                     st.markdown(TEMPLATES["irrelevant"])
                     st.session_state.chat_history.append({
@@ -298,71 +302,70 @@ def main():
                     stream_handler = SmartStreamHandler(stream_container)
 
                     try:
-                        # Convert session history to LangChain format
-                        lc_messages = []
-                        for item in st.session_state.chat_history:
-                            if item["role"] == "user":
-                                lc_messages.append(HumanMessage(content=item["content"]))
-                            elif item["role"] == "assistant":
-                                lc_messages.append(AIMessage(content=item["content"]))
-
-                        memory = ConversationBufferMemory(
-                            memory_key="chat_history",
-                            return_messages=True,
-                            output_key="answer",
-                            chat_memory=ChatMessageHistory(messages=lc_messages)
+                        # Simplified QA pipeline
+                        llm = Ollama(
+                            model=model_name,
+                            temperature=0.5,
+                            callbacks=[stream_handler]
                         )
 
+                        # Configure retriever
                         retriever = st.session_state.vectorstore.as_retriever(
                             search_type="similarity",
                             search_kwargs={
                                 "k": MAX_RETRIEVAL_DOCS,
-                                # "filter": {"metadata.document_hash": st.session_state.processed_pdf_hash}
+                                "score_threshold": 0.4  # Only include highly relevant chunks
                             }
                         )
 
-                        llm = Ollama(
-                            model=model_name,
-                            temperature=temperature,
-                            callbacks=[stream_handler]
-                        )
-                        # question_generator_chain = LLMChain(llm=llm, prompt=prompt)
-                        qa_chain = ConversationalRetrievalChain.from_llm(
+                        # Clean prompt template
+                        qa_template = """Answer the question based on the document content below.
+                        Provide a clear, structured response with:
+                        1. A brief Summary Paragraph overview
+                        2. 3-5 key points as bullet points
+                        3. Any important details or numbers when relevant
+                        4. also add like conclusion after complete the result
+                        5. try to give depth answer 
+
+                        Context: {context}
+                        Question: {question}
+                        """
+
+                        # Create and run QA chain
+                        qa_chain = RetrievalQA.from_chain_type(
                             llm=llm,
+                            chain_type="stuff",
                             retriever=retriever,
-                            memory=memory,
-                            return_source_documents=True,
-                            max_tokens_limit=500,
-                            verbose=True
+                            return_source_documents=False,
+                            # max_tokens_limit=1000,
+                            chain_type_kwargs={
+                                "prompt": PromptTemplate(
+                                    template=qa_template,
+                                    input_variables=["context", "question"]
+                                )
+                            }
                         )
-                        print(qa_chain)
-                        response = qa_chain.invoke({"question": prompt})
-                        print("response......... ",response)
-                        answer = response["answer"]
-                        print("answer ",answer)
 
+                        response = qa_chain({"query": prompt})
+                        answer = response["result"]
+
+                        # Post-process answer formatting
+                        answer = answer.replace("- ", "• ").replace("* ", "• ")  # Standardize bullets
                         stream_container.markdown(answer)
-
                         st.session_state.chat_history.append({
                             "role": "assistant",
                             "content": answer
                         })
 
-                    except TimeoutError:
-                        st.markdown(TEMPLATES["timeout"])
-                        st.session_state.chat_history.append({
-                            "role": "assistant",
-                            "content": TEMPLATES["timeout"]
-                        })
                     except Exception as e:
-                        st.error(f"Error: {str(e)}")
-                        st.markdown(TEMPLATES["no_answer"])
+                        error_msg = f"⚠️ Error processing your request: {str(e)}"
+                        st.error(error_msg)
                         st.session_state.chat_history.append({
                             "role": "assistant",
                             "content": TEMPLATES["no_answer"]
                         })
+                        st.markdown(TEMPLATES["no_answer"])
     else:
         st.info(TEMPLATES["welcome"])
-
 if __name__ == "__main__":
     main()
