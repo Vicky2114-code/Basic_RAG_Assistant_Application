@@ -66,7 +66,11 @@ def main():
         if st.session_state.initial_load:
             show_thinking_animation()
             st.session_state.initial_load = False
-        render_chat_history(st.session_state.chat_history)
+
+        # ✅ Render chat history with markdown formatting
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"], unsafe_allow_html=True)
 
         if prompt := st.chat_input("Ask about the document"):
             st.session_state.chat_history.append({"role": "user", "content": prompt})
@@ -76,24 +80,31 @@ def main():
             with st.chat_message("assistant"):
                 if not is_relevant(prompt, st.session_state.vectorstore):
                     st.markdown(TEMPLATES["irrelevant"])
-                    st.session_state.chat_history.append({"role": "assistant", "content": TEMPLATES["irrelevant"]})
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": TEMPLATES["irrelevant"]
+                    })
                 else:
                     container = st.empty()
                     handler = SmartStreamHandler(container)
 
                     llm = Ollama(model=model_name, temperature=temperature, callbacks=[handler])
-                    retriever = st.session_state.vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": MAX_RETRIEVAL_DOCS, "score_threshold": 0.4})
+                    retriever = st.session_state.vectorstore.as_retriever(
+                        search_type="similarity",
+                        search_kwargs={"k": MAX_RETRIEVAL_DOCS, "score_threshold": 0.4}
+                    )
 
                     prompt_template = PromptTemplate(
                         template="""Answer the question based on the document content below.
-                        1. Summary Paragraph
-                        2. 3–5 bullet points
-                        3. Important details/numbers
-                        4. Conclusion
-                        5. Provide depth
+1. Summary Paragraph  
+2. 3–5 bullet points  
+3. Important details/numbers  
+4. Conclusion  
+5. Provide depth
 
-                        Context: {context}
-                        Question: {question}""",
+Context: {context}
+
+Question: {question}""",
                         input_variables=["context", "question"]
                     )
 
@@ -106,9 +117,16 @@ def main():
                     )
 
                     result = qa_chain({"query": prompt})
-                    answer = result["result"].replace("- ", "• ").replace("* ", "• ")
-                    container.markdown(answer)
-                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                    answer = result["result"].strip()
+
+                    # ✅ Format and render the answer
+                    container.markdown(answer, unsafe_allow_html=True)
+
+                    # ✅ Store it in chat history as formatted markdown
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": answer
+                    })
     else:
         st.info(TEMPLATES["welcome"])
 
