@@ -1,4 +1,11 @@
-MONGO_URI = "mongodb+srv://vicky:vicky@cluster0.syoeipa.mongodb.net/RAG?retryWrites=true&w=majority"
-DB_NAME = "RAG"
-COLLECTION_NAME = "document_vectors"
-INDEX_NAME = "vector_index_1"
+from dotenv import load_dotenv
+import os
+
+# Load .env variables
+load_dotenv()
+
+# Access environment variables
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME")
+INDEX_NAME = os.getenv("INDEX_NAME")
