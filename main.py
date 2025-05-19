@@ -1,10 +1,13 @@
+from queue import Queue
+from threading import Thread
+
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import hashlib
 import io
 import json
-
-from langchain_core.callbacks import CallbackManager
+import os
+from langchain_core.callbacks import CallbackManager, BaseCallbackHandler
 
 from pdf_utils import extract_text_from_pdf
 from config import DB_NAME, COLLECTION_NAME, INDEX_NAME
@@ -14,9 +17,62 @@ from langchain_community.llms import Ollama
 from langchain.chains.retrieval_qa.base import RetrievalQA
 from langchain_core.prompts import PromptTemplate
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+from starlette.concurrency import run_in_threadpool
+from ollama import Client
+
 
 app = FastAPI()
 
+
+
+# Load model and base URL from env
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://0.0.0.0:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:1.5b")
+
+# Ollama client instance
+ollama_client = Client(host=OLLAMA_BASE_URL)
+
+# Token generator
+def generate_tokens(question: str):
+    for chunk in ollama_client.chat(
+        model=OLLAMA_MODEL,
+        messages=[{"role": "user", "content": question}],
+        stream=True
+    ):
+        yield chunk["message"]["content"]
+
+# Generator for StreamingResponse
+def generate_json_stream(question: str):
+    full_content = ""
+    for token in generate_tokens(question):
+        full_content += token
+        yield json.dumps({
+            "model": OLLAMA_MODEL,
+            "content": token,
+            "done": False
+        }).encode('utf-8') + b'\n'
+
+    # Final full chunk
+    yield json.dumps({
+        "model": OLLAMA_MODEL,
+        "full_content": full_content,
+        "done": True
+    }).encode('utf-8') + b'\n'
+
+# FastAPI route
+@app.post("/users/chat")
+async def ask_ai(request: Request):
+    body = await request.json()
+    question = body.get("question")
+
+    if not question:
+        return {"error": "Missing 'question'"}
+
+    # Run token generation in thread-safe context
+    return StreamingResponse(
+        generate_json_stream(question),
+        media_type="application/json"
+    )
 def calculate_file_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
@@ -59,6 +115,7 @@ async def chat_with_pdf(file_hash: str, request: Request):
     model_name = body.get("model", "deepseek-r1:1.5b")
     temperature = body.get("temperature", 0.3)
 
+    # DB setup (replace with your actual logic)
     client, err = init_mongo_connection()
     if err:
         return JSONResponse({"status": "error", "message": str(err)}, status_code=500)
@@ -74,13 +131,23 @@ async def chat_with_pdf(file_hash: str, request: Request):
         search_kwargs={"k": 5, "score_threshold": 0.4}
     )
 
+    # Token queue and full content tracker
+    token_queue = Queue()
+    full_content = []
+
+    class StreamingHandler(BaseCallbackHandler):
+        def on_llm_new_token(self, token: str, **kwargs):
+            token_queue.put(token)
+            full_content.append(token)
+
+    handler = StreamingHandler()
+    callback_manager = CallbackManager([handler])
+
     llm = Ollama(
         model=model_name,
         temperature=temperature,
-        callback_manager=CallbackManager([]),  # No token streaming
-        # streaming=False  # Important: Disable internal streaming
+        callback_manager=callback_manager
     )
-
 
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
@@ -92,12 +159,28 @@ async def chat_with_pdf(file_hash: str, request: Request):
 
     async def final_chunk_stream():
         yield json.dumps({"event": "start", "message": "Running QA..."}) + "\n"
-        try:
-            result = qa_chain({"query": prompt})
-            full_answer = result.get("result", "No answer.")
-            yield json.dumps({"event": "answer", "data": full_answer}) + "\n"
-        except Exception as e:
-            yield json.dumps({"event": "error", "message": str(e)}) + "\n"
+
+        def run_chain():
+            try:
+                qa_chain({"query": prompt})
+            except Exception as e:
+                token_queue.put(e)
+            token_queue.put(None)
+
+        Thread(target=run_chain).start()
+
+        while True:
+            token = token_queue.get()
+            if token is None:
+                break
+            elif isinstance(token, Exception):
+                yield json.dumps({"event": "error", "message": str(token)}) + "\n"
+                return
+            else:
+                yield json.dumps({"event": "token", "token": token}) + "\n"
+
+        full_answer = "".join(full_content)
+        yield json.dumps({"event": "answer", "data": full_answer}) + "\n"
         yield json.dumps({"event": "end", "message": "Completed"}) + "\n"
 
     return StreamingResponse(final_chunk_stream(), media_type="application/x-ndjson")
