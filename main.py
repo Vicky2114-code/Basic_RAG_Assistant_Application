@@ -4,6 +4,8 @@ import hashlib
 import io
 import json
 
+from langchain_core.callbacks import CallbackManager
+
 from pdf_utils import extract_text_from_pdf
 from config import DB_NAME, COLLECTION_NAME, INDEX_NAME
 from db import init_mongo_connection
@@ -11,6 +13,7 @@ from llm_utils import get_vectorstore
 from langchain_community.llms import Ollama
 from langchain.chains.retrieval_qa.base import RetrievalQA
 from langchain_core.prompts import PromptTemplate
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 
 app = FastAPI()
 
@@ -48,6 +51,7 @@ Question: {question}""",
     input_variables=["context", "question"]
 )
 
+
 @app.post("/chat/{file_hash}")
 async def chat_with_pdf(file_hash: str, request: Request):
     body = await request.json()
@@ -65,8 +69,18 @@ async def chat_with_pdf(file_hash: str, request: Request):
     if not vectorstore:
         return JSONResponse({"status": "error", "message": "No vectorstore found"}, status_code=404)
 
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5, "score_threshold": 0.4})
-    llm = Ollama(model=model_name, temperature=temperature)
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 5, "score_threshold": 0.4}
+    )
+
+    llm = Ollama(
+        model=model_name,
+        temperature=temperature,
+        callback_manager=CallbackManager([]),  # No token streaming
+        # streaming=False  # Important: Disable internal streaming
+    )
+
 
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
@@ -76,13 +90,14 @@ async def chat_with_pdf(file_hash: str, request: Request):
         chain_type_kwargs={"prompt": prompt_template}
     )
 
-    def generate():
-        # First event (streaming start)
-        yield json.dumps({"status": "streaming", "answer": ""}) + "\n"
+    async def final_chunk_stream():
+        yield json.dumps({"event": "start", "message": "Running QA..."}) + "\n"
+        try:
+            result = qa_chain({"query": prompt})
+            full_answer = result.get("result", "No answer.")
+            yield json.dumps({"event": "answer", "data": full_answer}) + "\n"
+        except Exception as e:
+            yield json.dumps({"event": "error", "message": str(e)}) + "\n"
+        yield json.dumps({"event": "end", "message": "Completed"}) + "\n"
 
-        # Simulate processing
-        result = qa_chain({"query": prompt})
-        answer = result["result"].strip()
-        yield json.dumps({"status": "complete", "answer": answer}) + "\n"
-
-    return StreamingResponse(generate(), media_type="application/json")
+    return StreamingResponse(final_chunk_stream(), media_type="application/x-ndjson")
