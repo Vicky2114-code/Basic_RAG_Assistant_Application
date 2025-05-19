@@ -8,15 +8,15 @@ from constant import IRRELEVANT_THRESHOLD
 
 def get_vectorstore(text, file_hash, collection, index_name):
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={'device': 'cpu'}, encode_kwargs={'normalize_embeddings': True})
-    existing_doc = collection.find_one({"metadata.document_hash": file_hash})
+    existing_doc = collection.find_one({"document_hash": file_hash})
     if existing_doc:
         st.info("Loading existing knowledge base...")
         return MongoDBAtlasVectorSearch(
     collection=collection,
     embedding=embeddings,
     index_name=index_name,
-    embedding_key="embedding",
-    text_key="text"
+    # embedding_key="embedding",
+    # text_key="text"
 )
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
